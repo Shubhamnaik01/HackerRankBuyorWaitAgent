@@ -4,6 +4,7 @@ log.txt
 # Python cache
 __pycache__/
 *.py[cod]
+code/.cache/
 
 # Environment variables / secrets
 .env

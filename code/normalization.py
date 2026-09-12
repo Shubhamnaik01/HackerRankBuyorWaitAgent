@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import Mapping
 
 from .exchange import ExchangeRateTable
 from .models import CashFlow, FinancialEvent, UserProfile
@@ -16,6 +17,7 @@ def explicit_future_flows(
     start: date,
     end: date,
     exchange: ExchangeRateTable,
+    amount_overrides: Mapping[str, Decimal] | None = None,
 ) -> tuple[list[CashFlow], list[str]]:
     """Normalize only explicit future cash state.
 
@@ -25,7 +27,15 @@ def explicit_future_flows(
     """
     flows: list[CashFlow] = []
     warnings: list[str] = []
+    overrides = amount_overrides or {}
+    active = {event.event_id for event in events if event.status in {"pending", "scheduled"}}
+    superseded = {
+        event.linked_event_id for event in events
+        if event.event_id in active and event.linked_event_id in active
+    }
     for event in events:
+        if event.event_id in superseded:
+            continue
         if event.status in IGNORED_STATUSES or event.status == "settled":
             continue
         if event.status == "pending" and event.direction != "debit":
@@ -35,11 +45,12 @@ def explicit_future_flows(
         flow_date = event.settlement_date or event.event_date
         if not start <= flow_date <= end:
             continue
-        if event.amount is None:
+        raw_amount = overrides.get(event.event_id, event.amount)
+        if raw_amount is None:
             warnings.append(f"{event.event_id}: missing amount; linked image evidence not interpreted")
             continue
         try:
-            amount = exchange.convert(event.amount, event.currency, profile.home_currency, flow_date)
+            amount = exchange.convert(raw_amount, event.currency, profile.home_currency, flow_date)
         except Exception as exc:
             warnings.append(f"{event.event_id}: {exc}")
             continue
@@ -53,4 +64,3 @@ def explicit_future_flows(
 
 def signed_amount(event: FinancialEvent, amount: Decimal) -> Decimal:
     return -amount if event.direction == "debit" else amount
-

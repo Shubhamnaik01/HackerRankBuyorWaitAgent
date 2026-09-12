@@ -51,7 +51,8 @@ class Forecast:
             return Decimal("0")
         future = [balance for when, balance, _ in path if when >= payment_date]
         available = min(future or [self.starting_balance]) - self.minimum_balance
-        return max(Decimal("0"), min(cap, available))
+        safe = max(Decimal("0"), min(cap, available))
+        return safe.quantize(self.policy.money_quantum, rounding=self.policy.rounding)
 
     def earliest_safe_full_payment(self, amount: Decimal) -> date | None:
         candidate = self.start

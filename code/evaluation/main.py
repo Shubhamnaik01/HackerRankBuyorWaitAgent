@@ -9,11 +9,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from code.core import DeterministicFinancialCore
 from code.data_loader import DatasetLoader
+from code.evidence.service import EvidenceService
+from code.evidence.usage import UsageTracker
 
 
 def main() -> int:
     data = DatasetLoader(REPO_ROOT / "dataset").load()
-    core = DeterministicFinancialCore(data)
+    usage = UsageTracker()
+    evidence = EvidenceService(data, usage=usage)
+    core = DeterministicFinancialCore(data, evidence=evidence)
     amount_matches = 0
     date_matches = 0
     differences: list[str] = []
@@ -34,6 +38,13 @@ def main() -> int:
     print("Differences:")
     for difference in differences:
         print(difference)
+    snapshot = usage.snapshot()
+    print(
+        "Evidence API usage: "
+        f"calls={snapshot['model_calls']}, input_tokens={snapshot['input_tokens']}, "
+        f"output_tokens={snapshot['output_tokens']}, total_tokens={snapshot['total_tokens']}, "
+        f"cache_hits={snapshot['cache_hits']}"
+    )
     return 0
 
 

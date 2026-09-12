@@ -1,0 +1,3 @@
+# Optional evidence interpretation dependency. Deterministic-only runs do not import it.
+openai>=1.66.0
+python-dotenv>=1.0.0

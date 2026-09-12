@@ -10,8 +10,12 @@ class RecurrencePolicy:
     monthly_max_gap_days: int = 35
     monthly_recency_days: int = 45
     variable_minimum_occurrences: int = 4
-    variable_max_interval_days: int = 21
-    variable_recency_multiplier: int = 2
+    variable_window_days: int = 28
+    variable_window_count: int = 3
+    variable_projection_interval_days: int = 7
+    essential_variable_categories: tuple[str, ...] = (
+        "groceries", "transport", "healthcare", "utilities",
+    )
     amount_lookback: int = 3
 
 
