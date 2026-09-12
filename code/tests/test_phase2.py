@@ -95,6 +95,28 @@ class PhaseTwoRecurrenceTests(unittest.TestCase):
         changed, _ = apply_evidence_to_flows(flows, [next_only], profile(), events, self.exchange, date(2026, 3, 1), date(2026, 5, 30))
         self.assertEqual([Decimal("800"), Decimal("1000")], [f.amount for f in sorted(changed, key=lambda f: f.flow_date)])
 
+    def test_salary_amendment_preserves_supported_payday(self):
+        flows = [
+            CashFlow(date(2026, 3, 15), Decimal("1000"), "recurring:salary", "salary", True),
+            CashFlow(date(2026, 4, 15), Decimal("1000"), "recurring:salary", "salary", True),
+        ]
+        events = {"salary": event(
+            "salary", date(2026, 2, 15), "1000", direction="credit",
+            category="salary", event_type="income", description="Payroll",
+        )}
+        fact = EvidenceFact(
+            "salary_change", "m", amount=Decimal("1200"), currency="USD",
+            effective_date=date(2026, 3, 1), scope="recurring",
+        )
+        changed, _ = apply_evidence_to_flows(
+            flows, [fact], profile(), events, self.exchange,
+            date(2026, 3, 1), date(2026, 5, 30),
+        )
+        self.assertEqual(
+            [date(2026, 3, 15), date(2026, 4, 15), date(2026, 5, 15)],
+            [flow.flow_date for flow in sorted(changed, key=lambda flow: flow.flow_date)],
+        )
+
     def test_delayed_salary_reanchors_future_paydays(self):
         flows = [
             CashFlow(date(2026, 3, 15), Decimal("1000"), "recurring:salary", "salary", True),
@@ -150,8 +172,69 @@ class PhaseTwoRecurrenceTests(unittest.TestCase):
         )
         flows = RecurrenceDetector(self.policy, self.exchange).infer(profile(), history, date(2026, 3, 1), date(2026, 3, 31))
         variable = [flow for flow in flows if flow.source == "recurring:variable"]
-        self.assertEqual(5, len(variable))
-        self.assertEqual([Decimal("-30.00")] * 5, [flow.amount for flow in variable])
+        self.assertEqual(31, len(variable))
+        self.assertEqual(Decimal("-120.00"), sum(flow.amount for flow in variable))
+
+    def test_variable_budget_uses_multiple_complete_cycles_and_resists_anomaly(self):
+        history = tuple(
+            event(f"g{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), amount)
+            for month, amounts in ((12, ("50", "50")), (1, ("50", "50")), (2, ("500", "500")))
+            for index, amount in enumerate(amounts)
+        )
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 3, 1), date(2026, 3, 31),
+        )
+        variable = [flow for flow in flows if flow.source == "recurring:variable"]
+        self.assertEqual(Decimal("-100.00"), sum(flow.amount for flow in variable))
+
+    def test_partial_current_cycle_does_not_compress_unused_budget(self):
+        history = tuple(
+            event(f"g{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "50")
+            for month in (12, 1, 2)
+            for index in range(2)
+        )
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 3, 16), date(2026, 3, 31),
+        )
+        variable = [flow for flow in flows if flow.source == "recurring:variable"]
+        self.assertEqual(16, len(variable))
+        self.assertEqual(Decimal("-51.61"), sum(flow.amount for flow in variable))
+
+    def test_duplicate_billing_cycle_is_not_promoted_to_fixed_recurrence(self):
+        history = (
+            event("r1", date(2026, 1, 3), "200", category="rent", description="Rent"),
+            event("r1-copy", date(2026, 1, 4), "200", category="rent", description="Rent"),
+            event("r2", date(2026, 2, 3), "200", category="rent", description="Rent"),
+            event("r3", date(2026, 3, 3), "200", category="rent", description="Rent"),
+        )
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 4, 1), date(2026, 5, 31),
+        )
+        self.assertFalse(any(flow.source == "recurring:monthly" for flow in flows))
+
+    def test_image_amount_enrichment_does_not_reanchor_salary_cycle(self):
+        history = (
+            event("s1", date(2026, 1, 15), "1000", direction="credit", category="salary", event_type="income", description="Payroll"),
+            event("s2", date(2026, 2, 15), "1000", direction="credit", category="salary", event_type="income", description="Payroll"),
+            event("s3", date(2026, 3, 30), None, direction="credit", category="salary", event_type="income", description="Payroll"),
+        )
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 4, 1), date(2026, 5, 31), {"s3": Decimal("1000")},
+        )
+        salary = [flow for flow in flows if flow.source == "recurring:salary"]
+        self.assertEqual([date(2026, 4, 15), date(2026, 5, 15)], [flow.flow_date for flow in salary])
+
+    def test_single_anomalous_salary_date_does_not_shift_supported_cycle(self):
+        history = (
+            event("s1", date(2026, 1, 15), "1000", direction="credit", category="salary", event_type="income", description="Payroll"),
+            event("s2", date(2026, 2, 15), "1000", direction="credit", category="salary", event_type="income", description="Payroll"),
+            event("s3", date(2026, 3, 29), "1000", direction="credit", category="salary", event_type="income", description="Payroll"),
+        )
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 4, 1), date(2026, 4, 30),
+        )
+        salary = [flow for flow in flows if flow.source == "recurring:salary"]
+        self.assertEqual([date(2026, 4, 15)], [flow.flow_date for flow in salary])
 
     def test_failed_lifecycle_counts_scheduled_retry_once_and_cancelled_none(self):
         failed = event("failed", date(2026, 3, 2), "50", status="failed", category="debt_repayment", event_type="debt_payment")

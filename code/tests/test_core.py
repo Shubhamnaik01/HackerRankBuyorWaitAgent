@@ -69,7 +69,7 @@ class CoreFinancialTests(unittest.TestCase):
         self.assertEqual([date(2026, 4, 15), date(2026, 5, 15), date(2026, 6, 15)], [flow.flow_date for flow in salary])
         self.assertEqual([Decimal("500")] * 3, [flow.amount for flow in salary])
 
-    def test_recurring_fixed_expense_uses_conservative_recent_amount(self):
+    def test_recurring_fixed_expense_reserves_high_recent_amount(self):
         history = (
             event("r1", date(2026, 1, 3), "200"),
             event("r2", date(2026, 2, 3), "220"),
@@ -103,6 +103,21 @@ class CoreFinancialTests(unittest.TestCase):
             self.policy,
         )
         self.assertEqual(date(2026, 1, 10), forecast.earliest_safe_full_payment(Decimal("500")))
+
+    def test_same_day_mandatory_debit_credit_and_payment_ordering(self):
+        forecast = Forecast(
+            date(2026, 1, 1), Decimal("200"), Decimal("100"),
+            [
+                CashFlow(date(2026, 1, 2), Decimal("100"), "confirmed-credit"),
+                CashFlow(date(2026, 1, 2), Decimal("-50"), "mandatory-debit"),
+            ],
+            self.policy,
+        )
+        self.assertEqual(date(2026, 1, 2), forecast.earliest_safe_full_payment(Decimal("100")))
+        self.assertEqual(
+            [Decimal("150"), Decimal("250"), Decimal("150")],
+            [balance for when, balance, _ in forecast.balances(date(2026, 1, 2), Decimal("100")) if when == date(2026, 1, 2)],
+        )
 
 
 if __name__ == "__main__":

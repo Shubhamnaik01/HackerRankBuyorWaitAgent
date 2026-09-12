@@ -26,6 +26,70 @@ def _event_cash_date(event: FinancialEvent) -> date:
     return event.settlement_date or event.event_date
 
 
+def _month_key(value: date) -> tuple[int, int]:
+    return value.year, value.month
+
+
+def _month_start(value: date) -> date:
+    return value.replace(day=1)
+
+
+def _month_end(value: date) -> date:
+    return value.replace(day=calendar.monthrange(value.year, value.month)[1])
+
+
+def _anchored_date(year: int, month: int, day: int | None) -> date:
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, last_day if day is None else min(day, last_day))
+
+
+def _supported_monthly_day(events: list[FinancialEvent]) -> int | None:
+    """Return a robust payday/due-day; None represents month end.
+
+    A single delayed or image-enriched observation must not move an otherwise
+    established cycle. Month-end series are recognized separately because
+    their numeric day naturally varies across February and 30/31-day months.
+    """
+    dates = [_event_cash_date(event) for event in events]
+    if sum((_month_end(value) - value).days <= 2 for value in dates) * 3 >= len(dates) * 2:
+        return None
+    return int(median(value.day for value in dates))
+
+
+def _next_supported_month(events: list[FinancialEvent]) -> date:
+    latest = max(_event_cash_date(event) for event in events)
+    following = _add_month(latest.replace(day=1))
+    return _anchored_date(following.year, following.month, _supported_monthly_day(events))
+
+
+def _deduplicate_lifecycle_history(events: list[FinancialEvent]) -> list[FinancialEvent]:
+    """Use at most one recurrence observation from a transaction lifecycle.
+
+    Same-direction lifecycle updates contribute their terminal settled row.
+    Mixed-direction lifecycles (for example, a purchase and reversal) are not
+    evidence that either cash flow repeats.
+    """
+    by_id = {event.event_id: event for event in events}
+    groups: dict[str, list[FinancialEvent]] = defaultdict(list)
+    for event in events:
+        root = event
+        seen: set[str] = set()
+        while root.linked_event_id and root.linked_event_id in by_id and root.event_id not in seen:
+            seen.add(root.event_id)
+            root = by_id[root.linked_event_id]
+        groups[root.event_id].append(event)
+
+    result: list[FinancialEvent] = []
+    for group in groups.values():
+        if len(group) == 1:
+            result.extend(group)
+            continue
+        signatures = {(event.direction, event.event_type, event.category) for event in group}
+        if len(signatures) == 1:
+            result.append(max(group, key=lambda event: (_event_cash_date(event), event.event_id)))
+    return result
+
+
 def _gaps(events: list[FinancialEvent]) -> list[int]:
     dates = [_event_cash_date(event) for event in events]
     return [(right - left).days for left, right in zip(dates, dates[1:])]
@@ -47,8 +111,9 @@ class RecurrenceDetector:
             if event.status == "settled"
             and (event.amount is not None or event.event_id in overrides)
             and event.direction in {"debit", "credit"}
-            and history_start <= _event_cash_date(event) < start
+            and history_start <= _event_cash_date(event) <= start
         ]
+        history = _deduplicate_lifecycle_history(history)
         history.sort(key=_event_cash_date)
         flows: list[CashFlow] = []
         modeled_ids: set[str] = set()
@@ -65,6 +130,25 @@ class RecurrenceDetector:
         flows.extend(self._infer_salary(profile, history, events, start, end, final_income, overrides))
         flows.extend(self._infer_other_monthly_income(profile, history, start, end, overrides))
 
+        # Categories with several transactions in multiple calendar cycles are
+        # budget-like spending, not several independent monthly commitments.
+        category_groups: dict[tuple[str, str], list[FinancialEvent]] = defaultdict(list)
+        for event in history:
+            if event.direction == "debit" and event.event_type in {"expense", "subscription"}:
+                category_groups[(event.category, event.currency)].append(event)
+        transaction_heavy_keys: set[tuple[str, str]] = set()
+        for key, group in category_groups.items():
+            cycle_counts: dict[tuple[int, int], int] = defaultdict(int)
+            for event in group:
+                cycle_counts[_month_key(_event_cash_date(event))] += 1
+            if sum(count >= 2 for count in cycle_counts.values()) >= 2:
+                transaction_heavy_keys.add(key)
+        essential_categories = set(self.policy.recurrence.essential_variable_categories)
+        essential_categories.update(profile.protected_categories)
+        variable_keys = {
+            key for key in transaction_heavy_keys if key[0] in essential_categories
+        }
+
         groups: dict[tuple[str, str, str, str], list[FinancialEvent]] = defaultdict(list)
         for event in history:
             groups[(event.event_type, event.description, event.category, event.direction)].append(event)
@@ -76,7 +160,13 @@ class RecurrenceDetector:
                 # delayed settlement dates do not break a genuine payroll
                 # series, while one-off credits are kept out.
                 continue
+            if (group[-1].category, group[-1].currency) in transaction_heavy_keys:
+                continue
             if len(group) < self.policy.recurrence.minimum_occurrences:
+                continue
+            # Multiple rows in one calendar cycle are ambiguous duplicates,
+            # not additional proof of monthly recurrence.
+            if len({_month_key(_event_cash_date(event)) for event in group}) != len(group):
                 continue
             gaps = _gaps(group)
             recent_gaps = gaps[-(self.policy.recurrence.minimum_occurrences - 1):]
@@ -87,8 +177,10 @@ class RecurrenceDetector:
                 continue
             modeled_ids.update(event.event_id for event in group)
             recent = group[-self.policy.recurrence.amount_lookback:]
-            raw_amount = max(overrides.get(event.event_id, event.amount) for event in recent)
-            next_date = _add_month(last_date)
+            raw_amount = max(
+                overrides.get(event.event_id, event.amount) for event in recent
+            )
+            next_date = _next_supported_month(group)
             while next_date <= end:
                 if next_date >= start:
                     try:
@@ -98,52 +190,98 @@ class RecurrenceDetector:
                     flows.append(CashFlow(next_date, signed_amount(group[-1], amount), "recurring:monthly", group[-1].event_id, True))
                 next_date = _add_month(next_date)
 
-        # Aggregate only essential/protected variable spending after stable
-        # commitments have been removed. A median observed 28-day category
-        # total is a robust baseline without pretending every merchant
-        # charge repeats at the median transaction interval.
-        essential_categories = set(self.policy.recurrence.essential_variable_categories)
-        essential_categories.update(profile.protected_categories)
-        variable: dict[tuple[str, str, str, str], list[FinancialEvent]] = defaultdict(list)
+        # Project transaction-heavy categories from complete calendar-cycle
+        # budgets. This separates how often purchases occur from how much a
+        # household normally spends in a cycle, excludes partial boundary
+        # months, and makes a single anomalous month unable to dominate.
+        variable: dict[tuple[str, str], list[FinancialEvent]] = defaultdict(list)
         for event in history:
-            if event.event_id in modeled_ids or event.direction != "debit" or event.event_type not in {"expense", "subscription"}:
+            if (
+                event.event_id in modeled_ids or event.direction != "debit"
+                or event.event_type not in {"expense", "subscription"}
+                or (event.category, event.currency) not in variable_keys
+            ):
                 continue
-            if event.category not in essential_categories:
-                continue
-            variable[(event.category, event.direction, event.flexibility, event.currency)].append(event)
+            variable[(event.category, event.currency)].append(event)
 
-        for group in variable.values():
+        for (category, currency), group in variable.items():
             group.sort(key=_event_cash_date)
             if len(group) < self.policy.recurrence.variable_minimum_occurrences:
                 continue
-            last_date = _event_cash_date(group[-1])
-            window_days = self.policy.recurrence.variable_window_days
-            if (start - last_date).days > window_days:
-                continue
-            totals: list[Decimal] = []
-            for index in range(self.policy.recurrence.variable_window_count):
-                window_end = start - timedelta(days=index * window_days)
-                window_start = window_end - timedelta(days=window_days)
+            first_full_month = _month_start(history_start)
+            if first_full_month < history_start:
+                first_full_month = _add_month(first_full_month)
+            cycle = first_full_month
+            cycle_totals: list[Decimal] = []
+            observed_cycles = 0
+            while _month_end(cycle) < start:
                 total = sum(
                     (overrides.get(event.event_id, event.amount) for event in group
-                     if window_start <= _event_cash_date(event) < window_end),
+                     if _month_key(_event_cash_date(event)) == _month_key(cycle)),
                     Decimal("0"),
                 )
-                totals.append(total)
-            raw_window_amount = Decimal(median(totals))
-            if raw_window_amount <= 0:
+                cycle_totals.append(total)
+                observed_cycles += int(total > 0)
+                cycle = _add_month(cycle)
+            if observed_cycles < self.policy.recurrence.minimum_occurrences or not cycle_totals:
                 continue
-            interval = self.policy.recurrence.variable_projection_interval_days
-            raw_amount = raw_window_amount * Decimal(interval) / Decimal(window_days)
-            next_date = start
-            while next_date <= end:
-                try:
-                    amount = self.exchange.convert(raw_amount, group[-1].currency, profile.home_currency, next_date)
-                except Exception:
-                    break
-                amount = amount.quantize(self.policy.money_quantum, rounding=self.policy.rounding)
-                flows.append(CashFlow(next_date, -amount, "recurring:variable", group[-1].event_id, True))
-                next_date += timedelta(days=interval)
+            raw_budget = Decimal(median(cycle_totals))
+            if raw_budget <= 0:
+                continue
+            current_spent = sum(
+                (overrides.get(event.event_id, event.amount) for event in group
+                 if _month_key(_event_cash_date(event)) == _month_key(start)),
+                Decimal("0"),
+            )
+            month = _month_start(start)
+            while month <= end:
+                period_start = max(start, month)
+                period_end = min(end, _month_end(month))
+                if _month_key(month) == _month_key(start):
+                    # The balance snapshot already reflects month-to-date
+                    # spending. Do not compress an unused early-month budget
+                    # into the remaining days.
+                    ordinary_remainder = (
+                        raw_budget * Decimal((period_end - period_start).days + 1)
+                        / Decimal(_month_end(month).day)
+                    )
+                    remaining_budget = min(
+                        max(Decimal("0"), raw_budget - current_spent),
+                        ordinary_remainder,
+                    )
+                else:
+                    # A 90-day horizon commonly ends part-way through a
+                    # calendar month; reserve only the covered share rather
+                    # than charging a whole additional budget cycle.
+                    remaining_budget = (
+                        raw_budget * Decimal((period_end - period_start).days + 1)
+                        / Decimal(_month_end(month).day)
+                    )
+                days = (period_end - period_start).days + 1
+                allocated = Decimal("0")
+                allocated_home = Decimal("0")
+                for offset in range(days):
+                    when = period_start + timedelta(days=offset)
+                    raw_amount = (
+                        remaining_budget - allocated
+                        if offset == days - 1 else remaining_budget / Decimal(days)
+                    )
+                    allocated += raw_amount
+                    if offset == days - 1 and currency == profile.home_currency:
+                        amount = remaining_budget.quantize(
+                            self.policy.money_quantum, rounding=self.policy.rounding,
+                        ) - allocated_home
+                    else:
+                        try:
+                            amount = self.exchange.convert(raw_amount, currency, profile.home_currency, when)
+                        except Exception:
+                            break
+                        amount = amount.quantize(self.policy.money_quantum, rounding=self.policy.rounding)
+                    allocated_home += amount
+                    flows.append(CashFlow(
+                        when, -amount, "recurring:variable", group[-1].event_id, True,
+                    ))
+                month = _add_month(month)
         return flows
 
     def _infer_salary(
@@ -193,10 +331,10 @@ class RecurrenceDetector:
             else amount_overrides.get(anchor.event_id, anchor.amount)
         )
         currency = anchor.currency
-        next_date = _add_month(_event_cash_date(anchor))
-        if not scheduled:
-            # Include the first occurrence following settled history.
-            next_date = _add_month(_event_cash_date(regular[-1]))
+        next_date = (
+            _add_month(_event_cash_date(anchor))
+            if scheduled else _next_supported_month(regular)
+        )
         result: list[CashFlow] = []
         while next_date <= end:
             if next_date >= start:

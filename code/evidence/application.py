@@ -61,15 +61,21 @@ def apply_evidence_to_flows(
                 warnings.append(f"{fact.source_id}: salary amount has no supported future pay date")
                 continue
             target_dates = [flow.flow_date for flow in salary if flow.flow_date >= effective]
-            if effective not in target_dates and fact.effective_date is not None:
-                target_dates.insert(0, effective)
             if fact.scope == "recurring":
-                when = effective
-                target_dates = []
-                while when <= end:
-                    if when >= start:
+                # An amendment's effective date changes the amount, not a
+                # separately supported payroll cadence. Only synthesize a
+                # cadence when no structured/inferred payday exists.
+                if not target_dates:
+                    when = effective
+                    while when <= end:
+                        if when >= start:
+                            target_dates.append(when)
+                        when = _add_month(when)
+                else:
+                    when = _add_month(target_dates[-1])
+                    while when <= end:
                         target_dates.append(when)
-                    when = _add_month(when)
+                        when = _add_month(when)
             elif target_dates:
                 target_dates = target_dates[:1]
             dates = set(target_dates)
