@@ -126,6 +126,11 @@ class DatasetLoader:
                 request_text=row["request_text"],
                 expected_amount_safe_to_pay=_decimal(row.get("amount_safe_to_pay", "")) if solved else None,
                 expected_earliest_date_for_full_payment=_date(row.get("earliest_date_for_full_payment", "")) if solved else None,
+                expected_affordability_status=row.get("affordability_status") if solved else None,
+                expected_recommended_payment_method=row.get("recommended_payment_method") if solved else None,
+                expected_payment_plan=row.get("payment_plan") if solved else None,
+                expected_spending_changes_needed=row.get("spending_changes_needed") if solved else None,
+                expected_decision_explanation=row.get("decision_explanation") if solved else None,
             )
             if request.request_id in result:
                 raise DataValidationError(f"duplicate request: {request.request_id}")

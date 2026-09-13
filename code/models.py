@@ -32,6 +32,11 @@ class Request:
     request_text: str
     expected_amount_safe_to_pay: Decimal | None = None
     expected_earliest_date_for_full_payment: date | None = None
+    expected_affordability_status: str | None = None
+    expected_recommended_payment_method: str | None = None
+    expected_payment_plan: str | None = None
+    expected_spending_changes_needed: str | None = None
+    expected_decision_explanation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,4 +115,3 @@ class CoreResult:
     baseline_safe: bool
     minimum_projected_balance: Decimal
     warnings: tuple[str, ...] = ()
-
