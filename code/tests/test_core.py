@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
-from code.config import ForecastPolicy
+from code.config import ForecastPolicy, inclusive_horizon_end
 from code.exchange import ExchangeRateTable
 from code.forecast import Forecast
 from code.models import CashFlow, ExchangeRate, FinancialEvent, UserProfile
@@ -162,6 +162,36 @@ class CoreFinancialTests(unittest.TestCase):
         )
         self.assertFalse(forecast.is_safe(date(2026, 1, 2), Decimal("40")))
         self.assertEqual(Decimal("50"), forecast.minimum_projected_balance(date(2026, 1, 2), Decimal("40")))
+
+    def test_ninety_day_horizon_contains_exactly_ninety_calendar_dates(self):
+        start = date(2026, 1, 1)
+        end = inclusive_horizon_end(start, self.policy.horizon_days)
+        forecast = Forecast(start, Decimal("200"), Decimal("100"), [], self.policy)
+        self.assertEqual(90, self.policy.horizon_days)
+        self.assertEqual(start + timedelta(days=89), end)
+        self.assertEqual(90, (end - start).days + 1)
+        self.assertEqual(end, forecast.end)
+
+    def test_start_and_ninetieth_date_flows_are_included(self):
+        start = date(2026, 1, 1)
+        end = start + timedelta(days=89)
+        forecast = Forecast(
+            start, Decimal("202"), Decimal("100"),
+            [CashFlow(start, Decimal("-1"), "start"), CashFlow(end, Decimal("-102"), "end")],
+            self.policy,
+        )
+        self.assertEqual([start, end], [flow.flow_date for flow in forecast.flows])
+        self.assertFalse(forecast.is_safe())
+
+    def test_flow_after_ninetieth_date_is_outside_safety_forecast(self):
+        start = date(2026, 1, 1)
+        outside = start + timedelta(days=90)
+        forecast = Forecast(
+            start, Decimal("200"), Decimal("100"),
+            [CashFlow(outside, Decimal("-1000"), "outside")], self.policy,
+        )
+        self.assertEqual([], forecast.flows)
+        self.assertTrue(forecast.is_safe())
 
 
 if __name__ == "__main__":

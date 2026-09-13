@@ -9,10 +9,12 @@ import unittest
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
+from code.config import ForecastPolicy, inclusive_horizon_end
 from code.data_loader import DatasetBundle
 from code.evaluation.package_check import package_manifest, validate_package_manifest
-from code.evaluation.submission_validator import REQUIRED_COLUMNS, validate_submission
+from code.evaluation.submission_validator import REQUIRED_COLUMNS, _supported_change_ids, validate_submission
 from code.evidence.usage import UsageTracker
 from code.models import FinancialEvent, PaymentOption, Request, UserProfile
 from code.planning import CandidatePlan, DecisionResult, Payment
@@ -117,6 +119,13 @@ class SubmissionValidatorTests(unittest.TestCase):
     def test_valid_complete_synthetic_output(self):
         self.path.write_text(render_output_csv([full_decision()]), encoding="utf-8")
         self.assertEqual((), validate_submission(self.path, self.data))
+
+    @patch("code.evaluation.submission_validator.RecurrenceDetector.infer", return_value=[])
+    def test_spending_change_support_uses_shared_inclusive_horizon(self, mocked_infer):
+        request = self.data.requests["request_1"]
+        self.assertEqual(set(), _supported_change_ids(self.data, request))
+        expected_end = inclusive_horizon_end(request.request_date, ForecastPolicy().horizon_days)
+        self.assertEqual(expected_end, mocked_infer.call_args.args[3])
 
     def test_missing_request(self):
         data = make_bundle("request_1", "request_2")

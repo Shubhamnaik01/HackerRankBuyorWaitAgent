@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from code.config import ForecastPolicy
+from code.config import ForecastPolicy, inclusive_horizon_end
 from code.data_loader import DatasetBundle, DatasetLoader
 from code.exchange import ExchangeRateTable
 from code.models import PaymentOption, Request, UserProfile
@@ -110,7 +110,7 @@ def _supported_change_ids(data: DatasetBundle, request: Request) -> set[str]:
     detector = RecurrenceDetector(policy, ExchangeRateTable(data.exchange_rates, policy))
     flows = detector.infer(
         data.profiles[request.user_id], data.events_by_user.get(request.user_id, ()),
-        request.request_date, request.request_date + timedelta(days=policy.horizon_days),
+        request.request_date, inclusive_horizon_end(request.request_date, policy.horizon_days),
     )
     return {
         flow.source_id for flow in flows

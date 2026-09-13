@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -395,6 +395,29 @@ class EvidenceBoundaryTests(unittest.TestCase):
             self.assertEqual({"model_calls": 1, "input_tokens": 20, "output_tokens": 5, "total_tokens": 25}, {
                 key: usage.snapshot()[key] for key in ("model_calls", "input_tokens", "output_tokens", "total_tokens")
             })
+
+    def test_image_evidence_uses_inclusive_ninety_date_endpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            inside_path = root / "inside.png"
+            outside_path = root / "outside.png"
+            inside_path.write_bytes(b"inside")
+            outside_path.write_bytes(b"outside")
+            start = request().request_date
+            inside = event("inside", start + timedelta(days=89), None)
+            outside = event("outside", start + timedelta(days=90), None)
+            images = (
+                ImageRecord("inside-image", "u", "r", "inside", inside_path),
+                ImageRecord("outside-image", "u", "r", "outside", outside_path),
+            )
+            client = FakeClient()
+            service = EvidenceService(
+                bundle(root, (inside, outside), (), images), client=client,
+                cache=EvidenceCache(None), enable_environment_client=False,
+            )
+            evidence = service.resolve(request(), 180, 90)
+            self.assertEqual({"inside"}, set(evidence.image_amounts))
+            self.assertEqual(1, client.image_calls)
 
     def test_malformed_model_message_is_rejected_before_engine(self):
         unknown = message("Payroll sent a bespoke compensation amendment; see the internal schedule.")

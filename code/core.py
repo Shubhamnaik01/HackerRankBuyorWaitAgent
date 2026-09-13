@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from .config import ForecastPolicy
+from .config import ForecastPolicy, inclusive_horizon_end
 from .data_loader import DatasetBundle
 from .exchange import ExchangeRateTable
 from .evidence.application import apply_evidence_to_flows
@@ -27,7 +27,7 @@ class DeterministicFinancialCore:
     def build_forecast(self, request: Request) -> tuple[Forecast, tuple[str, ...]]:
         profile = self.data.profiles[request.user_id]
         events = self.data.events_by_user.get(request.user_id, ())
-        end = request.request_date + timedelta(days=self.policy.horizon_days)
+        end = inclusive_horizon_end(request.request_date, self.policy.horizon_days)
         evidence = self.evidence.resolve(
             request, self.policy.recurrence.history_days, self.policy.horizon_days,
         )

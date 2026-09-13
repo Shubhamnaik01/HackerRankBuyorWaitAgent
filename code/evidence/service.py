@@ -5,6 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
+from ..config import inclusive_horizon_end
 from ..data_loader import DatasetBundle
 from ..models import FinancialEvent, Message, Request
 from .cache import EvidenceCache
@@ -61,7 +62,7 @@ class EvidenceService:
             self._resolve_message_with_model(message, allowed_event_ids, result)
 
         history_start = request.request_date - timedelta(days=history_days)
-        horizon_end = request.request_date + timedelta(days=horizon_days)
+        horizon_end = inclusive_horizon_end(request.request_date, horizon_days)
         for event in events:
             cash_date = event.settlement_date or event.event_date
             image = self.data.images_by_event.get(event.event_id)

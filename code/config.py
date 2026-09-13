@@ -1,5 +1,13 @@
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+
+
+def inclusive_horizon_end(start: date, horizon_days: int) -> date:
+    """Return the final date in an inclusive horizon of ``horizon_days`` dates."""
+    if horizon_days < 1:
+        raise ValueError("horizon_days must be at least 1")
+    return start + timedelta(days=horizon_days - 1)
 
 
 @dataclass(frozen=True)

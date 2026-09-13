@@ -3,18 +3,21 @@ from __future__ import annotations
 from datetime import date, timedelta
 from decimal import Decimal
 
-from .config import ForecastPolicy
+from .config import ForecastPolicy, inclusive_horizon_end
 from .models import CashFlow
 
 
 class Forecast:
     def __init__(self, start: date, starting_balance: Decimal, minimum_balance: Decimal, flows: list[CashFlow], policy: ForecastPolicy):
         self.start = start
-        self.end = start + timedelta(days=policy.horizon_days)
+        self.end = inclusive_horizon_end(start, policy.horizon_days)
         self.starting_balance = starting_balance
         self.minimum_balance = minimum_balance
         self.policy = policy
-        self.flows = sorted(flows, key=self._sort_key)
+        self.flows = sorted(
+            (flow for flow in flows if self.start <= flow.flow_date <= self.end),
+            key=self._sort_key,
+        )
 
     @staticmethod
     def _sort_key(flow: CashFlow) -> tuple:
