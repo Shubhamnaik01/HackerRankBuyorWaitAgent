@@ -203,6 +203,11 @@ class RecurrenceDetector:
             ):
                 continue
             variable[(event.category, event.currency)].append(event)
+        current_variable_cycle_started = any(
+            _month_key(_event_cash_date(event)) == _month_key(start)
+            for group in variable.values()
+            for event in group
+        )
 
         for (category, currency), group in variable.items():
             group.sort(key=_event_cash_date)
@@ -239,16 +244,17 @@ class RecurrenceDetector:
                 period_end = min(end, _month_end(month))
                 if _month_key(month) == _month_key(start):
                     # The balance snapshot already reflects month-to-date
-                    # spending. Do not compress an unused early-month budget
-                    # into the remaining days.
-                    ordinary_remainder = (
-                        raw_budget * Decimal((period_end - period_start).days + 1)
-                        / Decimal(_month_end(month).day)
-                    )
-                    remaining_budget = min(
-                        max(Decimal("0"), raw_budget - current_spent),
-                        ordinary_remainder,
-                    )
+                    # spending. Calendar days alone are not evidence that an
+                    # unstarted variable-spending cycle has consumed budget.
+                    unused_budget = max(Decimal("0"), raw_budget - current_spent)
+                    if current_variable_cycle_started:
+                        ordinary_remainder = (
+                            raw_budget * Decimal((period_end - period_start).days + 1)
+                            / Decimal(_month_end(month).day)
+                        )
+                        remaining_budget = min(unused_budget, ordinary_remainder)
+                    else:
+                        remaining_budget = unused_budget
                 else:
                     # A 90-day horizon commonly ends part-way through a
                     # calendar month; reserve only the covered share rather

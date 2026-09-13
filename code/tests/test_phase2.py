@@ -187,7 +187,7 @@ class PhaseTwoRecurrenceTests(unittest.TestCase):
         variable = [flow for flow in flows if flow.source == "recurring:variable"]
         self.assertEqual(Decimal("-100.00"), sum(flow.amount for flow in variable))
 
-    def test_partial_current_cycle_does_not_compress_unused_budget(self):
+    def test_unstarted_current_cycle_reserves_full_supported_budget(self):
         history = tuple(
             event(f"g{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "50")
             for month in (12, 1, 2)
@@ -198,7 +198,90 @@ class PhaseTwoRecurrenceTests(unittest.TestCase):
         )
         variable = [flow for flow in flows if flow.source == "recurring:variable"]
         self.assertEqual(16, len(variable))
+        self.assertEqual(Decimal("-100.00"), sum(flow.amount for flow in variable))
+
+    def test_started_current_cycle_preserves_partial_period_cap(self):
+        history = tuple(
+            event(f"g{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "50")
+            for month in (12, 1, 2)
+            for index in range(2)
+        ) + (event("g3-current", date(2026, 3, 5), "10"),)
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 3, 16), date(2026, 3, 31),
+        )
+        variable = [flow for flow in flows if flow.source == "recurring:variable"]
+        self.assertEqual(16, len(variable))
         self.assertEqual(Decimal("-51.61"), sum(flow.amount for flow in variable))
+
+    def test_any_started_essential_variable_category_preserves_partial_cycle_treatment(self):
+        groceries = tuple(
+            event(f"g{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "50")
+            for month in (12, 1, 2)
+            for index in range(2)
+        )
+        transport = tuple(
+            event(
+                f"t{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "25",
+                category="transport", description="Bus fare",
+            )
+            for month in (12, 1, 2)
+            for index in range(2)
+        ) + (event(
+            "t-current", date(2026, 3, 5), "10",
+            category="transport", description="Bus fare",
+        ),)
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), groceries + transport, date(2026, 3, 16), date(2026, 3, 31),
+        )
+        groceries_budget = sum(
+            (flow.amount for flow in flows
+             if flow.source == "recurring:variable" and (flow.source_id or "").startswith("g")),
+            Decimal("0"),
+        )
+        self.assertEqual(Decimal("-51.61"), groceries_budget)
+
+    def test_month_to_date_spending_reduces_budget_without_replay(self):
+        history = tuple(
+            event(f"g{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "50")
+            for month in (12, 1, 2)
+            for index in range(2)
+        ) + (event("g3-current", date(2026, 3, 1), "30"),)
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 3, 2), date(2026, 3, 31),
+        )
+        variable = [flow for flow in flows if flow.source == "recurring:variable"]
+        self.assertEqual(30, len(variable))
+        self.assertTrue(all(flow.flow_date >= date(2026, 3, 2) for flow in variable))
+        self.assertEqual(Decimal("-70.00"), sum(flow.amount for flow in variable))
+
+    def test_future_variable_cycles_are_unchanged(self):
+        history = tuple(
+            event(f"g{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "50")
+            for month in (12, 1, 2)
+            for index in range(2)
+        )
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 3, 16), date(2026, 4, 30),
+        )
+        variable = [flow for flow in flows if flow.source == "recurring:variable"]
+        march = sum((flow.amount for flow in variable if flow.flow_date.month == 3), Decimal("0"))
+        april = sum((flow.amount for flow in variable if flow.flow_date.month == 4), Decimal("0"))
+        self.assertEqual(Decimal("-100.00"), march)
+        self.assertEqual(Decimal("-100.00"), april)
+
+    def test_transaction_heavy_optional_category_does_not_become_essential(self):
+        history = tuple(
+            event(
+                f"d{month}-{index}", date(2025 if month == 12 else 2026, month, 5 + index * 10), "50",
+                category="dining", description="Restaurant",
+            )
+            for month in (12, 1, 2)
+            for index in range(2)
+        )
+        flows = RecurrenceDetector(self.policy, self.exchange).infer(
+            profile(), history, date(2026, 3, 1), date(2026, 3, 31),
+        )
+        self.assertFalse(any(flow.source == "recurring:variable" for flow in flows))
 
     def test_duplicate_billing_cycle_is_not_promoted_to_fixed_recurrence(self):
         history = (
