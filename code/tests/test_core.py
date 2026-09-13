@@ -39,8 +39,8 @@ class CoreFinancialTests(unittest.TestCase):
 
     def test_pending_debit_is_reserved_but_pending_credit_is_ignored(self):
         events = (
-            event("debit", date(2026, 2, 1), "80", status="pending", settlement_date=date(2026, 2, 3)),
-            event("credit", date(2026, 2, 1), "500", status="pending", direction="credit", settlement_date=date(2026, 2, 3)),
+            event("debit", date(2026, 2, 1), "80", status="pending", settlement_date=date(2026, 2, 1)),
+            event("credit", date(2026, 2, 1), "500", status="pending", direction="credit", settlement_date=date(2026, 2, 1)),
         )
         flows, _ = explicit_future_flows(profile(), events, date(2026, 2, 1), date(2026, 5, 2), self.exchange)
         self.assertEqual([Decimal("-80")], [flow.amount for flow in flows])
@@ -79,14 +79,14 @@ class CoreFinancialTests(unittest.TestCase):
         rent = [flow for flow in flows if flow.source == "recurring:monthly"]
         self.assertEqual([Decimal("-220"), Decimal("-220")], [flow.amount for flow in rent])
 
-    def test_minimum_balance_is_enforced_with_mandatory_debits_before_credits(self):
+    def test_same_day_confirmed_credit_and_debit_are_netted(self):
         forecast = Forecast(
             date(2026, 1, 1), Decimal("200"), Decimal("100"),
             [CashFlow(date(2026, 1, 2), Decimal("100"), "salary"), CashFlow(date(2026, 1, 2), Decimal("-150"), "bill")],
             self.policy,
         )
-        self.assertFalse(forecast.is_safe())
-        self.assertEqual(Decimal("50"), forecast.minimum_projected_balance())
+        self.assertTrue(forecast.is_safe())
+        self.assertEqual(Decimal("150"), forecast.minimum_projected_balance())
 
     def test_amount_safe_to_pay_uses_full_forecast_and_cap(self):
         forecast = Forecast(
@@ -104,7 +104,7 @@ class CoreFinancialTests(unittest.TestCase):
         )
         self.assertEqual(date(2026, 1, 10), forecast.earliest_safe_full_payment(Decimal("500")))
 
-    def test_same_day_mandatory_debit_credit_and_payment_ordering(self):
+    def test_candidate_payment_follows_same_day_normal_net(self):
         forecast = Forecast(
             date(2026, 1, 1), Decimal("200"), Decimal("100"),
             [
@@ -113,11 +113,55 @@ class CoreFinancialTests(unittest.TestCase):
             ],
             self.policy,
         )
-        self.assertEqual(date(2026, 1, 2), forecast.earliest_safe_full_payment(Decimal("100")))
+        self.assertEqual(date(2026, 1, 1), forecast.earliest_safe_full_payment(Decimal("100")))
         self.assertEqual(
-            [Decimal("150"), Decimal("250"), Decimal("150")],
+            [Decimal("250"), Decimal("150")],
             [balance for when, balance, _ in forecast.balances(date(2026, 1, 2), Decimal("100")) if when == date(2026, 1, 2)],
         )
+
+    def test_same_day_salary_can_fund_payment_after_normal_activity(self):
+        forecast = Forecast(
+            date(2026, 1, 1), Decimal("150"), Decimal("100"),
+            [CashFlow(date(2026, 1, 1), Decimal("100"), "confirmed-salary")],
+            self.policy,
+        )
+        self.assertEqual(Decimal("150.00"), forecast.maximum_safe_payment(date(2026, 1, 1), Decimal("150")))
+        self.assertTrue(forecast.is_safe(date(2026, 1, 1), Decimal("150")))
+
+    def test_later_credit_cannot_fund_payment_today(self):
+        forecast = Forecast(
+            date(2026, 1, 1), Decimal("150"), Decimal("100"),
+            [CashFlow(date(2026, 1, 2), Decimal("100"), "confirmed-credit")],
+            self.policy,
+        )
+        self.assertEqual(Decimal("50.00"), forecast.maximum_safe_payment(date(2026, 1, 1), Decimal("150")))
+        self.assertFalse(forecast.is_safe(date(2026, 1, 1), Decimal("150")))
+        self.assertEqual(date(2026, 1, 2), forecast.earliest_safe_full_payment(Decimal("150")))
+
+    def test_same_day_net_and_candidate_must_still_preserve_minimum(self):
+        forecast = Forecast(
+            date(2026, 1, 1), Decimal("200"), Decimal("100"),
+            [
+                CashFlow(date(2026, 1, 2), Decimal("100"), "confirmed-credit"),
+                CashFlow(date(2026, 1, 2), Decimal("-150"), "mandatory-debit"),
+            ],
+            self.policy,
+        )
+        self.assertFalse(forecast.is_safe(date(2026, 1, 2), Decimal("60")))
+        self.assertEqual(Decimal("90"), forecast.minimum_projected_balance(date(2026, 1, 2), Decimal("60")))
+
+    def test_safety_is_enforced_on_later_forecast_dates(self):
+        forecast = Forecast(
+            date(2026, 1, 1), Decimal("200"), Decimal("100"),
+            [
+                CashFlow(date(2026, 1, 2), Decimal("100"), "confirmed-credit"),
+                CashFlow(date(2026, 1, 2), Decimal("-50"), "mandatory-debit"),
+                CashFlow(date(2026, 2, 1), Decimal("-160"), "later-essential"),
+            ],
+            self.policy,
+        )
+        self.assertFalse(forecast.is_safe(date(2026, 1, 2), Decimal("40")))
+        self.assertEqual(Decimal("50"), forecast.minimum_projected_balance(date(2026, 1, 2), Decimal("40")))
 
 
 if __name__ == "__main__":

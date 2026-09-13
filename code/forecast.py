@@ -18,27 +18,29 @@ class Forecast:
 
     @staticmethod
     def _sort_key(flow: CashFlow) -> tuple:
-        if flow.source == "candidate-payment":
-            same_day_order = 2
-        else:
-            same_day_order = 0 if flow.amount < 0 else 1
-        return flow.flow_date, same_day_order, flow.source, flow.source_id or ""
+        return flow.flow_date, flow.source, flow.source_id or ""
 
     def balances_for_payments(
         self, payments: tuple[tuple[date, Decimal], ...] = (),
     ) -> list[tuple[date, Decimal, str]]:
-        entries = list(self.flows)
-        entries.extend(
-            CashFlow(when, -amount, "candidate-payment", f"candidate-{index}")
-            for index, (when, amount) in enumerate(payments)
-            if amount
-        )
-        entries.sort(key=self._sort_key)
+        normal_by_date: dict[date, Decimal] = {}
+        for flow in self.flows:
+            normal_by_date[flow.flow_date] = normal_by_date.get(flow.flow_date, Decimal("0")) + flow.amount
+
+        payments_by_date: dict[date, list[Decimal]] = {}
+        for when, amount in payments:
+            if amount:
+                payments_by_date.setdefault(when, []).append(amount)
+
         balance = self.starting_balance
         path = [(self.start, balance, "opening-balance")]
-        for flow in entries:
-            balance += flow.amount
-            path.append((flow.flow_date, balance, flow.source))
+        for flow_date in sorted(normal_by_date.keys() | payments_by_date.keys()):
+            if flow_date in normal_by_date:
+                balance += normal_by_date[flow_date]
+                path.append((flow_date, balance, "normal-daily-net"))
+            for amount in payments_by_date.get(flow_date, ()):
+                balance -= amount
+                path.append((flow_date, balance, "candidate-payment"))
         return path
 
     def balances(self, payment_date: date | None = None, payment_amount: Decimal = Decimal("0")) -> list[tuple[date, Decimal, str]]:
@@ -58,11 +60,14 @@ class Forecast:
         if not self.is_safe():
             return Decimal("0")
         path = self.balances()
-        prior = [balance for when, balance, _ in path if when < payment_date]
-        if prior and min(prior) < self.minimum_balance:
-            return Decimal("0")
-        future = [balance for when, balance, _ in path if when >= payment_date]
-        available = min(future or [self.starting_balance]) - self.minimum_balance
+        balance_at_payment = self.starting_balance
+        for when, balance, _ in path:
+            if when > payment_date:
+                break
+            balance_at_payment = balance
+        future = [balance_at_payment]
+        future.extend(balance for when, balance, _ in path if when > payment_date)
+        available = min(future) - self.minimum_balance
         safe = max(Decimal("0"), min(cap, available))
         return safe.quantize(self.policy.money_quantum, rounding=self.policy.rounding)
 

@@ -22,10 +22,9 @@ class RecurrencePolicy:
 @dataclass(frozen=True)
 class ForecastPolicy:
     horizon_days: int = 90
-    # Mandatory debits are applied before confirmed credits on the same date.
-    # An elective candidate payment is applied after both, so confirmed money
-    # settling that day can fund it, as demonstrated by the solved examples.
-    debits_before_credits: bool = True
+    # Retained for caller compatibility. Ordinary same-day activity is always
+    # evaluated as a date-level net; candidate payments follow that daily net.
+    debits_before_credits: bool = False
     money_quantum: Decimal = Decimal("0.01")
     rounding: str = ROUND_HALF_UP
     recurrence: RecurrencePolicy = field(default_factory=RecurrencePolicy)
