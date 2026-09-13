@@ -47,6 +47,15 @@ class UsageReportTests(unittest.TestCase):
         self.assertIn("https://developers.openai.com/api/docs/models/gpt-5-mini", report)
         self.assertIn("Cost formula:", report)
 
+    def test_report_includes_safe_validation_diagnostics(self):
+        usage = UsageTracker()
+        usage.record_validation_failure(
+            "image", "image_1", "request_1", "image currency EUR conflicts with USD", 1,
+        )
+        report = render_usage_report(usage, 1)
+        self.assertIn("Evidence validation diagnostics", report)
+        self.assertIn("| image | image_1 | request_1 | 1 | image currency EUR conflicts with USD |", report)
+
 
 if __name__ == "__main__":
     unittest.main()

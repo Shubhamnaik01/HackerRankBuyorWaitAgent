@@ -104,12 +104,32 @@ def render_usage_report(
         f"- Average total tokens per request: {_number(Decimal(snapshot['total_tokens']) / requests)}",
         f"- Cache hits: {snapshot['cache_hits']}",
         f"- Validation failures: {snapshot['validation_failures']}",
+    ]
+    diagnostics = snapshot.get("validation_failure_details", [])
+    if diagnostics:
+        lines.extend([
+            "",
+            "## Evidence validation diagnostics",
+            "",
+            "Only source identifiers and validator reasons are recorded; message and image contents are omitted.",
+            "Each row represents one rejected model response; a successful retry does not erase the failure.",
+            "",
+            "| Source type | Source ID | Request ID | Attempt | Validation reason |",
+            "|---|---|---|---:|---|",
+        ])
+        for diagnostic in diagnostics:
+            lines.append(
+                f"| {diagnostic['source_type']} | {diagnostic['source_id']} | "
+                f"{diagnostic['request_id'] or 'not supplied'} | {diagnostic['attempt']} | "
+                f"{diagnostic['reason']} |"
+            )
+    lines.extend([
         "",
         "## Per-model breakdown",
         "",
         "| Provider | Model | Calls | Input tokens | Output tokens | Total tokens | Estimated cost (USD) |",
         "|---|---|---:|---:|---:|---:|---:|",
-    ]
+    ])
     if groups:
         for provider, model in sorted(groups):
             totals = groups[(provider, model)]

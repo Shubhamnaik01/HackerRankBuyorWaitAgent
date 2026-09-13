@@ -13,11 +13,12 @@ from code.evidence.application import apply_evidence_to_flows
 from code.evidence.cache import EvidenceCache
 from code.evidence.messages import parse_message_deterministically
 from code.evidence.models import ALLOWED_FACT_KINDS, ALLOWED_SCOPES, EvidenceFact
-from code.evidence.openai_client import MESSAGE_SCHEMA, ModelResult
+from code.evidence.openai_client import MESSAGE_SCHEMA, ModelResult, OpenAIEvidenceClient
 from code.evidence.openai_client import REPO_ROOT, load_repository_environment
 from code.evidence.service import EvidenceService
 from code.evidence.usage import UsageTracker
 from code.evidence.validation import EvidenceValidationError, validate_fact, validate_image_amount
+from code.evaluation.usage_report import render_usage_report
 from code.exchange import ExchangeRateTable
 from code.models import CashFlow, FinancialEvent, ImageRecord, Message, Request, UserProfile
 from code.normalization import explicit_future_flows
@@ -66,14 +67,33 @@ class FakeClient:
         self.image_payload = image_payload or {"amount": "42.50", "currency": "USD", "relevant_date": None}
         self.message_calls = 0
         self.image_calls = 0
+        self.message_validation_errors: list[str | None] = []
+        self.image_validation_errors: list[str | None] = []
 
-    def extract_message(self, _message):
+    def extract_message(self, _message, validation_error=None):
         self.message_calls += 1
+        self.message_validation_errors.append(validation_error)
         return ModelResult(self.message_payload, self.model, 10, 4, 14)
 
-    def extract_image(self, _path, _event):
+    def extract_image(self, _path, _event, validation_error=None):
         self.image_calls += 1
+        self.image_validation_errors.append(validation_error)
         return ModelResult(self.image_payload, self.model, 20, 5, 25)
+
+
+class SequencedClient(FakeClient):
+    def __init__(self, *, message_payloads=(), image_payloads=()):
+        super().__init__()
+        self.message_payloads = list(message_payloads)
+        self.image_payloads = list(image_payloads)
+
+    def extract_message(self, message, validation_error=None):
+        self.message_payload = self.message_payloads[min(self.message_calls, len(self.message_payloads) - 1)]
+        return super().extract_message(message, validation_error)
+
+    def extract_image(self, path, event, validation_error=None):
+        self.image_payload = self.image_payloads[min(self.image_calls, len(self.image_payloads) - 1)]
+        return super().extract_image(path, event, validation_error)
 
 
 class PhaseTwoRecurrenceTests(unittest.TestCase):
@@ -328,6 +348,22 @@ class PhaseTwoRecurrenceTests(unittest.TestCase):
 
 
 class EvidenceBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _invalid_scope_payload():
+        return {"facts": [{
+            "kind": "salary_change", "related_event_id": None, "amount": "1200",
+            "currency": "USD", "effective_date": "2026-03-15", "multiplier": None,
+            "category": None, "scope": "monthly",
+        }]}
+
+    @staticmethod
+    def _valid_salary_payload():
+        return {"facts": [{
+            "kind": "salary_change", "related_event_id": None, "amount": "1200",
+            "currency": "USD", "effective_date": "2026-03-15", "multiplier": None,
+            "category": None, "scope": "recurring",
+        }]}
+
     def test_structured_output_schema_enums_match_production_validation(self):
         variants = MESSAGE_SCHEMA["properties"]["facts"]["items"]["anyOf"]
         self.assertEqual(
@@ -346,6 +382,12 @@ class EvidenceBoundaryTests(unittest.TestCase):
             self.assertEqual("string", by_kind["confirmed_one_time_income"]["properties"][field]["type"])
         self.assertEqual("string", by_kind["salary_delay"]["properties"]["effective_date"]["type"])
         self.assertEqual("string", by_kind["recurring_expense_multiplier"]["properties"]["multiplier"]["type"])
+
+    def test_retry_instruction_carries_specific_error_without_relaxing_schema(self):
+        instruction = OpenAIEvidenceClient._retry_instruction("invalid scope: 'monthly'")
+        self.assertIn("invalid scope: 'monthly'", instruction)
+        self.assertIn("same strict schema", instruction)
+        self.assertIn("Do not weaken", instruction)
 
     @patch("code.evidence.openai_client.load_dotenv", return_value=True)
     def test_repository_dotenv_is_loaded_without_overriding_process_values(self, mocked_load):
@@ -395,6 +437,93 @@ class EvidenceBoundaryTests(unittest.TestCase):
             self.assertEqual({"model_calls": 1, "input_tokens": 20, "output_tokens": 5, "total_tokens": 25}, {
                 key: usage.snapshot()[key] for key in ("model_calls", "input_tokens", "output_tokens", "total_tokens")
             })
+            self.assertEqual([None], client.image_validation_errors)
+
+    def test_message_semantic_failure_retries_once_and_succeeds(self):
+        unknown = message("Payroll sent a bespoke compensation amendment; see the internal schedule.")
+        client = SequencedClient(message_payloads=(
+            self._invalid_scope_payload(), self._valid_salary_payload(),
+        ))
+        usage = UsageTracker()
+        service = EvidenceService(
+            bundle(Path("."), (), (unknown,), ()), client=client, usage=usage,
+            cache=EvidenceCache(None), enable_environment_client=False,
+        )
+        evidence = service.resolve(request(), 180, 90)
+        self.assertEqual(["salary_change"], [fact.kind for fact in evidence.facts])
+        self.assertEqual(2, client.message_calls)
+        self.assertEqual([None, "invalid scope: 'monthly'"], client.message_validation_errors)
+        self.assertEqual(2, usage.call_count)
+        self.assertEqual(28, usage.total_tokens)
+        self.assertEqual(1, usage.validation_failures)
+        self.assertEqual([], evidence.warnings)
+
+    def test_image_semantic_failure_retries_once_and_succeeds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "i.png"
+            path.write_bytes(b"image-placeholder")
+            missing = event("e", date(2026, 2, 20), None)
+            image = ImageRecord("i", "u", "r", "e", path)
+            client = SequencedClient(image_payloads=(
+                {"amount": "42.50", "currency": "EUR", "relevant_date": None},
+                {"amount": "42.50", "currency": "USD", "relevant_date": None},
+            ))
+            usage = UsageTracker()
+            service = EvidenceService(
+                bundle(root, (missing,), (), (image,)), client=client, usage=usage,
+                cache=EvidenceCache(None), enable_environment_client=False,
+            )
+            evidence = service.resolve(request(), 180, 90)
+            self.assertEqual(Decimal("42.50"), evidence.image_amounts["e"].amount)
+            self.assertEqual(2, client.image_calls)
+            self.assertIn("conflicts with structured event currency", client.image_validation_errors[1])
+            self.assertEqual(2, usage.call_count)
+            self.assertEqual(1, usage.validation_failures)
+
+    def test_valid_first_model_response_is_not_retried_and_cache_hit_calls_nothing(self):
+        unknown = message("Payroll sent a bespoke compensation amendment; see the internal schedule.")
+        with tempfile.TemporaryDirectory() as temp:
+            cache = EvidenceCache(Path(temp))
+            first_client = FakeClient(message_payload={"facts": []})
+            first = EvidenceService(
+                bundle(Path("."), (), (unknown,), ()), client=first_client,
+                cache=cache, enable_environment_client=False,
+            )
+            first.resolve(request(), 180, 90)
+            self.assertEqual(1, first_client.message_calls)
+            self.assertEqual([None], first_client.message_validation_errors)
+
+            second_client = FakeClient(message_payload=self._invalid_scope_payload())
+            usage = UsageTracker()
+            second = EvidenceService(
+                bundle(Path("."), (), (unknown,), ()), client=second_client, usage=usage,
+                cache=cache, enable_environment_client=False,
+            )
+            second.resolve(request(), 180, 90)
+            self.assertEqual(0, second_client.message_calls)
+            self.assertEqual(1, usage.cache_hits)
+            self.assertEqual(0, usage.call_count)
+            self.assertEqual(0, usage.validation_failures)
+
+    def test_ordinary_extraction_exception_is_not_retried(self):
+        class RaisingClient(FakeClient):
+            def extract_message(self, _message, validation_error=None):
+                self.message_calls += 1
+                raise RuntimeError("simulated transport failure")
+
+        unknown = message("Payroll sent a bespoke compensation amendment; see the internal schedule.")
+        client = RaisingClient()
+        usage = UsageTracker()
+        service = EvidenceService(
+            bundle(Path("."), (), (unknown,), ()), client=client, usage=usage,
+            cache=EvidenceCache(None), enable_environment_client=False,
+        )
+        evidence = service.resolve(request(), 180, 90)
+        self.assertEqual(1, client.message_calls)
+        self.assertEqual(0, usage.call_count)
+        self.assertEqual(0, usage.validation_failures)
+        self.assertIn("message extraction failed", evidence.warnings[0])
 
     def test_image_evidence_uses_inclusive_ninety_date_endpoint(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -430,17 +559,13 @@ class EvidenceBoundaryTests(unittest.TestCase):
         evidence = service.resolve(request(), 180, 90)
         self.assertEqual([], evidence.facts)
         self.assertIn("rejected model evidence", evidence.warnings[0])
-        self.assertEqual(1, usage.call_count)
-        self.assertEqual(14, usage.total_tokens)
-        self.assertEqual(1, usage.validation_failures)
+        self.assertEqual(2, usage.call_count)
+        self.assertEqual(28, usage.total_tokens)
+        self.assertEqual(2, usage.validation_failures)
 
     def test_invalid_scope_is_rejected_but_completed_call_usage_is_retained(self):
         unknown = message("Payroll sent a bespoke compensation amendment; see the internal schedule.")
-        client = FakeClient(message_payload={"facts": [{
-            "kind": "salary_change", "related_event_id": None, "amount": "1200",
-            "currency": "USD", "effective_date": "2026-03-15", "multiplier": None,
-            "category": None, "scope": "monthly",
-        }]})
+        client = FakeClient(message_payload=self._invalid_scope_payload())
         usage = UsageTracker()
         service = EvidenceService(
             bundle(Path("."), (), (unknown,), ()), client=client, usage=usage,
@@ -449,11 +574,37 @@ class EvidenceBoundaryTests(unittest.TestCase):
         evidence = service.resolve(request(), 180, 90)
         self.assertEqual([], evidence.facts)
         self.assertIn("invalid scope: 'monthly'", evidence.warnings[0])
-        self.assertEqual(1, usage.call_count)
-        self.assertEqual(10, usage.input_tokens)
-        self.assertEqual(4, usage.output_tokens)
-        self.assertEqual(14, usage.total_tokens)
-        self.assertEqual(1, usage.validation_failures)
+        self.assertEqual(2, usage.call_count)
+        self.assertEqual(20, usage.input_tokens)
+        self.assertEqual(8, usage.output_tokens)
+        self.assertEqual(28, usage.total_tokens)
+        self.assertEqual(2, usage.validation_failures)
+        second = service.resolve(request(), 180, 90)
+        self.assertEqual([], second.facts)
+        self.assertEqual(2, client.message_calls)
+        self.assertEqual(2, usage.validation_failures)
+
+    def test_safe_validation_diagnostic_omits_untrusted_message_content(self):
+        private_text = "PRIVATE-CONTENT Payroll sent a bespoke compensation amendment."
+        unknown = message(private_text, message_id="message-safe-id")
+        client = FakeClient(message_payload=self._invalid_scope_payload())
+        client.model = "gpt-5-mini"
+        usage = UsageTracker()
+        service = EvidenceService(
+            bundle(Path("."), (), (unknown,), ()), client=client, usage=usage,
+            cache=EvidenceCache(None), enable_environment_client=False,
+        )
+        service.resolve(request(), 180, 90)
+        details = usage.snapshot()["validation_failure_details"]
+        self.assertEqual(2, len(details))
+        self.assertEqual("message", details[0]["source_type"])
+        self.assertEqual("message-safe-id", details[0]["source_id"])
+        self.assertEqual("r", details[0]["request_id"])
+        self.assertEqual("invalid scope: 'monthly'", details[0]["reason"])
+        report = render_usage_report(usage, 1)
+        self.assertIn("message-safe-id", report)
+        self.assertIn("invalid scope", report)
+        self.assertNotIn("PRIVATE-CONTENT", report)
 
 
 if __name__ == "__main__":
